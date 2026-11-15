@@ -1,0 +1,27 @@
+# EDAS Lite (EasyDomainAPI System Lite)
+# Copyright (C) 2026 华阳互联
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Apache 环境下把 public/ 作为站点根目录，所有请求交给 index.php。
+# Nginx 等价配置：
+#   location / { try_files $uri $uri/ /index.php?$query_string; }
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # 已存在的真实文件（如静态资源）直接返回
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+
+    RewriteRule ^ index.php [QSA,L]
+</IfModule>
+
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+</IfModule>
+
+# 禁止访问隐藏文件与备份文件
+<FilesMatch "^\.">
+    Require all denied
+</FilesMatch>

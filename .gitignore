@@ -1,0 +1,43 @@
+# ---- 依赖 ----
+/vendor/
+
+# ---- 环境变量（含 APP_KEY 与各注册商密钥，严禁提交）----
+/.env
+/.env.local
+/.env.*.local
+
+# ---- SQLite 数据库与临时文件 ----
+/storage/*.sqlite
+/storage/*.sqlite-journal
+/storage/*.sqlite-wal
+/storage/*.sqlite-shm
+/edas.sqlite
+
+# ---- 根目录及任意位置的 SQLite 数据文件 ----
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# ---- 日志 ----
+*.log
+
+# ---- IDE / 编辑器 ----
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# ---- 系统文件 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 其他 ----
+/coverage/
+/.phpunit.result.cache
+
+# 注意：composer.lock 刻意不忽略。
+# 本项目 type: project，作为可部署应用需要锁定依赖版本，
+# 请将 composer.lock 提交到版本库，保证各环境安装结果一致。

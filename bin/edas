@@ -1,0 +1,229 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * EDAS Lite (EasyDomainAPI System Lite)
+ *
+ * Copyright (C) 2026 华阳互联
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * 运维命令行。用法：php bin/edas <command> [args]
+ *   migrate            执行数据库迁移
+ *   health             检查配置与数据库状态（不消耗注册商积分）
+ *   registrars         列出已配置的注册商与路由顺序
+ *   expire [minutes]   把超时未支付订单标记为 expired，默认 60 分钟
+ *   prune [days]       清理过期幂等键，默认 7 天
+ *   orders [limit]     列出最近订单
+ */
+
+declare(strict_types=1);
+
+use Edas\Lite\Adapters\DomainNameApiAdapter;
+use Edas\Lite\Adapters\NameComAdapter;
+use Edas\Lite\Adapters\NameSiloAdapter;
+use Edas\Lite\Order\OrderService;
+use Edas\Lite\Router\RegistrarRouter;
+use Edas\Lite\Storage\Database;
+use Edas\Lite\Storage\IdempotencyStore;
+use GuzzleHttp\Client;
+
+$root = dirname(__DIR__);
+
+$autoload = $root . '/vendor/autoload.php';
+if (!is_file($autoload)) {
+    fwrite(STDERR, "未找到 vendor/autoload.php，请先执行 composer install\n");
+    exit(1);
+}
+
+require $autoload;
+
+$_ENV['EDAS_BASE_PATH'] = $root;
+\Dotenv\Dotenv::createImmutable($root)->safeLoad();
+
+$env = static function (string $name, ?string $default = null): ?string {
+    $value = $_ENV[$name] ?? $_SERVER[$name] ?? getenv($name);
+
+    return is_string($value) && $value !== '' ? $value : $default;
+};
+
+$command = $argv[1] ?? 'help';
+
+if ($command === 'help' || $command === '--help' || $command === '-h') {
+    echo <<<TXT
+EDAS Lite 运维命令
+
+  php bin/edas migrate            执行数据库迁移
+  php bin/edas health             检查配置与数据库（不消耗注册商积分）
+  php bin/edas registrars         列出已配置注册商与路由顺序
+  php bin/edas expire [minutes]   标记超时未支付订单为 expired
+  php bin/edas prune [days]       清理过期幂等键
+  php bin/edas orders [limit]     列出最近订单
+
+TXT;
+    exit(0);
+}
+
+$timeout = (int) $env('HTTP_TIMEOUT', '30');
+
+try {
+    $database = new Database($env('DB_PATH'));
+} catch (Throwable $e) {
+    fwrite(STDERR, '数据库不可用: ' . $e->getMessage() . PHP_EOL);
+    exit(1);
+}
+
+$http = new Client([
+    'timeout'     => $timeout,
+    'http_errors' => false,
+    'headers'     => ['User-Agent' => 'EDAS-Lite/1.0 (+https://zxynb.com.cn)'],
+]);
+
+$adapters = [];
+
+if ((string) $env('NAMESILO_API_KEY', '') !== '') {
+    $adapters['namesilo'] = new NameSiloAdapter([
+        'apiKey'  => (string) $env('NAMESILO_API_KEY'),
+        'timeout' => $timeout,
+    ], $http);
+}
+
+if ((string) $env('NAMECOM_USERNAME', '') !== '' && (string) $env('NAMECOM_TOKEN', '') !== '') {
+    $adapters['namecom'] = new NameComAdapter([
+        'username' => (string) $env('NAMECOM_USERNAME'),
+        'token'    => (string) $env('NAMECOM_TOKEN'),
+        'apiBase'  => (string) $env('NAMECOM_API_BASE', 'https://api.name.com'),
+        'timeout'  => $timeout,
+    ], $http);
+}
+
+if ((string) $env('DOMAINNAMEAPI_RESELLER_ID', '') !== '' && (string) $env('DOMAINNAMEAPI_API_KEY', '') !== '') {
+    $adapters['domainnameapi'] = new DomainNameApiAdapter([
+        'resellerId' => (string) $env('DOMAINNAMEAPI_RESELLER_ID'),
+        'apiKey'     => (string) $env('DOMAINNAMEAPI_API_KEY'),
+        'apiBase'    => (string) $env('DOMAINNAMEAPI_API_BASE', 'https://api.domainresellerapi.com'),
+        'timeout'    => $timeout,
+    ], $http);
+}
+
+try {
+    switch ($command) {
+        case 'migrate':
+            $php = PHP_BINARY;
+            $runner = $root . '/migrations/run.php';
+            passthru(escapeshellarg($php) . ' ' . escapeshellarg($runner), $code);
+            exit($code);
+
+        case 'health':
+            $ok = true;
+
+            echo "EDAS Lite 健康检查\n";
+            echo str_repeat('-', 40) . "\n";
+
+            $appKey = (string) $env('APP_KEY', '');
+            printf("APP_KEY            %s\n", $appKey === '' ? '缺失（服务将拒绝所有请求）' : '已配置（' . strlen($appKey) . ' 字符）');
+            $ok = $ok && $appKey !== '';
+
+            printf("DB_PATH            %s\n", $database->path());
+            $hasOrders = $database->hasTable('orders');
+            $hasIdem = $database->hasTable('idempotency_keys');
+            $hasMap = $database->hasTable('domain_registrar_map');
+            printf("数据表             orders=%s idempotency_keys=%s domain_registrar_map=%s\n",
+                $hasOrders ? 'ok' : '缺失',
+                $hasIdem ? 'ok' : '缺失',
+                $hasMap ? 'ok' : '缺失'
+            );
+            $ok = $ok && $hasOrders && $hasIdem && $hasMap;
+
+            printf("注册商             %s\n", $adapters === [] ? '无（至少配置一家）' : implode(', ', array_keys($adapters)));
+            $ok = $ok && $adapters !== [];
+
+            printf("REGISTRAR_PRIORITY %s\n", (string) $env('REGISTRAR_PRIORITY', 'namesilo,namecom'));
+            printf("SMART_PRICE_ROUTING %s\n", (string) $env('SMART_PRICE_ROUTING', 'false'));
+
+            echo str_repeat('-', 40) . "\n";
+            echo $ok ? "结论：配置看起来可用\n" : "结论：存在缺失项，先补齐再使用\n";
+
+            exit($ok ? 0 : 1);
+
+        case 'registrars':
+            $priority = array_values(array_filter(array_map(
+                static fn ($item) => strtolower(trim($item)),
+                explode(',', (string) $env('REGISTRAR_PRIORITY', 'namesilo,namecom'))
+            )));
+
+            if ($adapters === []) {
+                echo "没有配置任何注册商凭证\n";
+                exit(1);
+            }
+
+            $router = new RegistrarRouter($adapters, $priority, false);
+
+            echo "已配置注册商: " . implode(', ', array_keys($adapters)) . "\n";
+            echo "实际路由顺序: " . implode(' -> ', $router->available()) . "\n";
+
+            foreach ($adapters as $name => $adapter) {
+                echo sprintf("  - %-14s %s\n", $name, $adapter::class);
+            }
+
+            exit(0);
+
+        case 'expire':
+            $minutes = isset($argv[2]) ? (int) $argv[2] : 60;
+
+            if ($adapters === []) {
+                fwrite(STDERR, "未配置任何注册商，无法构造订单服务\n");
+                exit(1);
+            }
+
+            $service = new OrderService(
+                $database,
+                new IdempotencyStore($database),
+                new RegistrarRouter($adapters, [], false),
+                (string) $env('APP_KEY', '')
+            );
+            $count = $service->expireStale($minutes);
+            echo sprintf("已把 %d 条超过 %d 分钟未支付的订单标记为 expired\n", $count, max(1, $minutes));
+            exit(0);
+
+        case 'prune':
+            $days = isset($argv[2]) ? (int) $argv[2] : 7;
+            $count = (new IdempotencyStore($database))->prune($days);
+            echo sprintf("已清理 %d 条超过 %d 天的幂等键\n", $count, max(1, $days));
+            exit(0);
+
+        case 'orders':
+            $limit = isset($argv[2]) ? (int) $argv[2] : 20;
+            $rows = $database->fetchAll(
+                'SELECT id, domain, years, registrar, status, amount, currency, error_code, created_at
+                   FROM orders ORDER BY created_at DESC LIMIT ' . max(1, min(200, $limit))
+            );
+
+            if ($rows === []) {
+                echo "没有订单\n";
+                exit(0);
+            }
+
+            printf("%-20s %-30s %-5s %-14s %-16s %10s %s\n", 'ID', 'DOMAIN', 'YRS', 'REGISTRAR', 'STATUS', 'AMOUNT', 'ERROR');
+            foreach ($rows as $row) {
+                printf(
+                    "%-20s %-30s %-5s %-14s %-16s %10.2f %s\n",
+                    $row['id'],
+                    $row['domain'],
+                    $row['years'],
+                    $row['registrar'],
+                    $row['status'],
+                    (float) $row['amount'],
+                    $row['error_code'] ?? '-'
+                );
+            }
+
+            exit(0);
+
+        default:
+            fwrite(STDERR, sprintf("未知命令: %s，执行 php bin/edas help 查看可用命令\n", $command));
+            exit(1);
+    }
+} catch (Throwable $e) {
+    fwrite(STDERR, '执行失败: ' . $e->getMessage() . PHP_EOL);
+    exit(1);
+}

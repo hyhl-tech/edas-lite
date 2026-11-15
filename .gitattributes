@@ -1,0 +1,18 @@
+# EDAS Lite (EasyDomainAPI System Lite)
+# Copyright (C) 2026 华阳互联
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# 统一换行：仓库内一律 LF，避免 Windows 拉取后 bin/edas 的 shebang 与
+# .htaccess 出现 CRLF 导致在 Linux 服务器上异常。
+
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.sqlite binary
+*.png binary
+*.jpg binary
+*.ico binary
+
+composer.lock text eol=lf
